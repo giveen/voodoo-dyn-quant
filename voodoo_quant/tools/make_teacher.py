@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 from voodoo_quant.ggml import quantize_tensor
 
-_SKIP_FRAGMENTS = ("norm", "bias", "A_log", "dt_bias", "conv1d")
+_SKIP_FRAGMENTS = ("norm", "bias", "A_log", "dt_bias", "conv1d", "visual", "merger")
 
 
 def load_state_dict(model_dir: Path, strip_prefix: str) -> dict[str, torch.Tensor]:

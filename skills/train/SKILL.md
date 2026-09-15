@@ -115,7 +115,68 @@ Then launch with `voodoo tp` (applies hardware env defaults, then torchrun):
 - **Keep your own imatrix** (`--imatrix`); calibration volume is worth only
   ~0.2% PPL — assignment dominates ~15×.
 
-## 3. Launch patterns
+## 3. Large model, single-GPU (no tensor parallel)
+
+If the full bf16 model exceeds VRAM (e.g. Qwen3.8-27B ≈ 51 GB on a 32 GB
+card), the trainer's default `source_model.to(device)` OOMs before
+MixedQuant replacement. Fix: the trainer now defers `.to(device)` until
+after replacement, so only lightweight gates/nodes materialize on the GPU.
+
+Adapting a 4×GPU TP script to single-GPU:
+- Drop `torchrun --nproc_per_node=N --master_port=P`.
+- Drop `--tensor_parallel N`.
+- Change `--device cuda:0` → `--device cuda`.
+- Keep `--lazy` (mmap loading essential for 27B on one card).
+- Keep `--gradient_checkpointing` (saves ~50% activation memory).
+- Keep `--no_compile` (Triton kernel safety).
+- If `--imatrix` points to a missing GGUF (no BF16 reference available),
+  drop the flag entirely — assignment dominates ~15× over calibration.
+
+Example adapted script (`configs/qwen38_27b_voodoo30_gpu1.sh`):
+
+```bash
+exec .venv/bin/python -m voodoo_quant.cli train \
+    --model /mnt/storage/models/swift-qwen3.8-27b \
+    --base_checkpoint checkpoints/Qwen3.8-27B/swift-qwen3.8-27b_base.pt \
+    --text_model_class qwen3_5_text \
+    --teacher_quant Q8_0 \
+    --teacher_checkpoint checkpoints/Qwen3.8-27B/swift-qwen3.8-27b_teacher_q8_0.pt \
+    --compression_ratio 0.30 \
+    --budget_reduction 0.03 \
+    --tensor_upgrades '[{\"pattern\":\"mlp\\.(gate|up|down)_proj$\",\"levels\":1},{\"pattern\":\"linear_attn|self_attn\",\"levels\":-1}]' \
+    --seq_len 8192 --batch_size 1 --grad_accum_steps 1 \
+    --max_steps 50 --lr 0.5 --size_weight 100.0 --size_tolerance 0.02 \
+    --lazy \
+    --candidate_types Q8_0 Q5_K IQ3_S IQ2_S IQ2_XXS IQ1_S \
+    --attention_candidates Q5_K IQ3_S IQ2_S IQ2_XXS \
+    --non_attention_candidates IQ4_XS IQ3_S IQ2_S IQ2_XXS IQ1_S \
+    --gradient_checkpointing \
+    --data_dir data/qwen38-longctx --data_name train_tokens.pt \
+    --output_dir checkpoints/Qwen3.8-27B/Voodoo30 \
+    --output_name Qwen3.8-27B-Voodoo30.pt \
+    --log_file logs/qwen38_voodoo30_train.jsonl \
+    --device cuda --dtype bfloat16 \
+    --partial_save_interval 1 \
+    --no_compile
+```
+
+### Pitfalls
+
+- **make-teacher on multimodal checkpoints**: `voodoo make-teacher`
+  requires `--strip_prefix model.language_model.` for vision-language
+  wrappers. Without it, the vision MLP (`linear_fc1`, `linear_fc2`)
+  fails Q8_0 quantization (its `in_features=4304` is not divisible by
+  32). The skip list now includes `visual`/`merger` — vision tensors
+  stay BF16 in the teacher, which is correct for a language-model-only
+  Voodoo run. Always verify the teacher produced a `.pt` file and log
+  shows `Done.` with file sizes.
+- **imatrix optional**: if no BF16 GGUF exists to generate one from,
+  drop `--imatrix`. The train skill notes assignment dominates ~15×.
+- **Q8 teacher on CPU**: `--teacher_device cpu` materializes the Q8
+  teacher on CPU, halving VRAM pressure at the cost of slower per-step
+  reload. Useful on borderline cards (24 GB).
+
+## 4. Launch patterns
 
 - **Layer-wise sharding** (no torchrun, heterogeneous GPUs):
   add `--device_map cuda:0,cuda:1,...` instead of TP.
@@ -124,7 +185,7 @@ Then launch with `voodoo tp` (applies hardware env defaults, then torchrun):
 - **Auto-resume**: TP launchers resume from `output_dir/partial.pt` when
   present (see configs/qwen38_27b_voodoo30_tp4.sh for the reference script).
 
-## 4. Monitoring / recovery
+## 5. Monitoring / recovery
 
 - JSONL training log: `--log_file` (loss, tau, size_mb per step).
 - Journal: `partial.pt` every `--partial_save_interval` optimizer steps.
@@ -134,7 +195,7 @@ Then launch with `voodoo tp` (applies hardware env defaults, then torchrun):
 - Do not interrupt the init/candidate-quantization phase (it is quantizing,
   not hung). Kill `-USR1 <pid>` dumps a heap census to the log.
 
-## 5. Verify before declaring done
+## 6. Verify before declaring done
 
 - Final log line shows total bytes within `size_tolerance` of target.
 - `quant_assignments.json` exists and covers every targeted tensor.
