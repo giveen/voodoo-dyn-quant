@@ -1837,7 +1837,11 @@ def run(args):
     elif shard_devices:
         _shard_model(source_model, layer_devices, device)
     else:
-        source_model.to(device)
+        # Defer .to(device) until after MixedQuant replacement.  The full bf16
+        # model (51 GiB for Qwen3.8-27B) exceeds the 32 GiB GPU; after
+        # replacement, only lightweight gates/norms remain (~2 GiB).  qbytes
+        # stay on CPU in lazy mode (or GPU if --qbytes_device cuda).
+        print(f"  deferring .to({device}) until after MixedQuant replacement (model too large)", flush=True)
 
     if args.gradient_checkpointing:
         target = source_model.model if isinstance(source_model, LMWithHead) else source_model
@@ -2191,6 +2195,12 @@ def run(args):
             pass
 
     replaced: dict[str, MixedQuantLinear | MixedQuantEmbedding] = {**replaced_linear, **replaced_embed}
+
+    # Deferred .to(device) from above: the full bf16 model doesn't fit on the
+    # GPU, but after MixedQuant replacement only lightweight gates/norms remain.
+    if device.type == "cuda":
+        source_model.to(device)
+        print(f"  moved replaced model to {device}", flush=True)
 
     # Optional tensor-parallel SSM (GatedDeltaNet) sharding — common/tp_ssm.py.
     # Runs AFTER MixedQuant replacement: candidate-cache keys keep the
